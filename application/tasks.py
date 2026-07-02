@@ -661,6 +661,168 @@ def _chatgpt_workspace_join_failure(account) -> str:
     return f"Workspace Join 失败: {reason or 'not completed'}"
 
 
+def _chatgpt_workspace_cpa_generated(account) -> bool:
+    if getattr(account, "platform", "") != "chatgpt":
+        return False
+    extra = getattr(account, "extra", None) or {}
+    if not isinstance(extra, dict):
+        return False
+    workspace_join = extra.get("workspace_join")
+    if not isinstance(workspace_join, dict) or not workspace_join.get("ok"):
+        return False
+    cpa_export = workspace_join.get("cpa_export")
+    if not isinstance(cpa_export, dict) or not cpa_export.get("ok"):
+        return False
+    return bool(
+        str(
+            cpa_export.get("path")
+            or cpa_export.get("file")
+            or cpa_export.get("output_path")
+            or ""
+        ).strip()
+    )
+
+
+def _should_consume_mailbox_after_registration(account, *, workspace_join_required: bool) -> bool:
+    if workspace_join_required and getattr(account, "platform", "") == "chatgpt":
+        return _chatgpt_workspace_cpa_generated(account)
+    return True
+
+
+def _prune_failed_chatgpt_workspace_ids(
+    extra: dict[str, Any],
+    failed_workspace_ids: list[str] | tuple[str, ...] | set[str],
+    logger: TaskLogger | None = None,
+) -> list[str]:
+    failed = [str(item or "").strip() for item in failed_workspace_ids if str(item or "").strip()]
+    if not failed:
+        return []
+    failed_set = set(failed)
+    try:
+        from platforms.chatgpt.workspace_join import parse_workspace_ids
+
+        cfg = dict(extra.get("chatgpt_workspace_join") or {})
+        current = parse_workspace_ids(cfg.get("workspace_ids", extra.get("workspace_ids", "")))
+        remaining = [workspace_id for workspace_id in current if workspace_id not in failed_set]
+        removed = [workspace_id for workspace_id in current if workspace_id in failed_set]
+        if not removed:
+            return remaining
+        cfg["workspace_ids"] = remaining
+        extra["chatgpt_workspace_join"] = cfg
+        if "workspace_ids" in extra:
+            extra["workspace_ids"] = remaining
+        if logger is not None:
+            logger.log(
+                "Workspace Join: 已从本次任务候选空间中删除失败 ID: "
+                f"{', '.join(removed)}; remaining={len(remaining)}"
+            )
+        return remaining
+    except Exception as exc:
+        if logger is not None:
+            logger.log(f"Workspace Join: 删除失败空间 ID 时出错（忽略）: {exc}", level="warning")
+        return []
+
+
+def _mailbox_account_from_platform_account_by_provider(account, provider_names: set[str]) -> Any | None:
+    extra = dict(getattr(account, "extra", {}) or {})
+    resources = list(extra.get("provider_resources") or [])
+    identity = dict(extra.get("identity") or {})
+    if isinstance(identity.get("provider_resource"), dict):
+        resources.append(identity["provider_resource"])
+    provider_accounts = list(extra.get("provider_accounts") or [])
+    if isinstance(identity.get("provider_account"), dict):
+        provider_accounts.append(identity["provider_account"])
+
+    for item in resources:
+        if not isinstance(item, dict):
+            continue
+        provider_name = str(item.get("provider_name") or item.get("provider") or "").strip().lower()
+        if provider_name not in provider_names:
+            continue
+        handle = str(item.get("handle") or item.get("email") or getattr(account, "email", "") or "").strip()
+        resource_id = str(item.get("resource_identifier") or item.get("account_id") or handle).strip()
+        if not handle:
+            continue
+        provider_account = {}
+        for candidate in provider_accounts:
+            if not isinstance(candidate, dict):
+                continue
+            candidate_name = str(candidate.get("provider_name") or candidate.get("provider") or "").strip().lower()
+            if candidate_name == provider_name:
+                provider_account = candidate
+                break
+        from core.base_mailbox import MailboxAccount
+
+        return MailboxAccount(
+            email=handle,
+            account_id=resource_id,
+            extra={
+                "mailbox_provider_key": provider_name,
+                "provider_resource": item,
+                "provider_account": provider_account,
+            },
+        )
+    return None
+
+
+def _resolve_shared_mailbox_for_account(shared_mailbox, mailbox_account):
+    if shared_mailbox is None:
+        return None
+    resolver = getattr(shared_mailbox, "_resolve_mailbox", None)
+    if callable(resolver):
+        try:
+            return resolver(mailbox_account)
+        except Exception:
+            pass
+    return shared_mailbox
+
+
+def _mark_local_ms_mailbox_event(
+    shared_mailbox,
+    account,
+    event: str,
+    logger: TaskLogger,
+    *,
+    error: str = "",
+) -> None:
+    mailbox_account = _mailbox_account_from_platform_account_by_provider(
+        account,
+        {"local_ms_pool", "local_ms"},
+    )
+    if mailbox_account is None:
+        return
+    mailbox = _resolve_shared_mailbox_for_account(shared_mailbox, mailbox_account)
+    if mailbox is None:
+        return
+    try:
+        if event == "registration_success":
+            marker = getattr(mailbox, "mark_registration_success", None)
+            applied = marker(mailbox_account) if callable(marker) else []
+            label = "已消费"
+        elif event == "registration_failure":
+            marker = getattr(mailbox, "mark_registration_failure", None)
+            applied = marker(mailbox_account, error=error) if callable(marker) else []
+            label = "已释放"
+        else:
+            return
+        if applied:
+            logger.log(f"localMs 邮箱池{label}: {getattr(mailbox_account, 'email', '')}")
+    except Exception as exc:
+        logger.log(f"localMs 邮箱池状态更新失败（忽略）: {exc}", level="warning")
+
+
+def _release_current_mailbox_lease(shared_mailbox, logger: TaskLogger, *, error: str = "") -> None:
+    release = getattr(shared_mailbox, "release_current_lease", None)
+    if not callable(release):
+        return
+    try:
+        applied = release(error=error)
+        if applied:
+            logger.log("localMs 邮箱池已释放当前失败任务的临时占用")
+    except Exception as exc:
+        logger.log(f"localMs 邮箱池释放临时占用失败（忽略）: {exc}", level="warning")
+
+
 def _outlook_mailbox_account_from_platform_account(account) -> Any | None:
     extra = dict(getattr(account, "extra", {}) or {})
     resources = list(extra.get("provider_resources") or [])
@@ -1172,6 +1334,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     password = payload.get("password") or None
     proxy = payload.get("proxy") or None
     extra = dict(payload.get("extra") or {})
+    payload = dict(payload)
+    payload["extra"] = extra
 
     # 强校验：ChatGPT Plus 自动支付链接 + sms_pool 模式下，**每个并发线程
     # 独占一条 SMS 号**——所以数量约束是 ``len(pool) >= concurrency``，**不是**
@@ -1180,6 +1344,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     sms_pool_slots: list[str] = []  # 启动后每个 slot 一条号字符串（"+phone----url"）
     sms_pool_extras: list[dict] = []  # 备份池：当某线程被 PayPal 拒号时换号用
     sms_pool_lock = threading.Lock()  # 保护 extras 的并发读取
+    workspace_ids_lock = threading.Lock()
     # 当某线程触发 swap 但 extras 为空时置 set —— 整个任务级别立刻停止投新任务，
     # 让正在跑的任务自然失败结束，避免下一批又抢同一条死号继续被拒。
     sms_pool_exhausted = threading.Event()
@@ -1427,12 +1592,49 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 logger.log(f"使用代理: {resolved_proxy}")
             account = platform.register(email=email, password=password)
             save_account(account)
+            workspace_join_required = False
+            if platform_name == "chatgpt":
+                try:
+                    from platforms.chatgpt.workspace_join import workspace_join_enabled
+
+                    workspace_join_required = workspace_join_enabled(dict(_build_payload.get("extra") or {}))
+                except Exception:
+                    workspace_join_required = False
+            account_extra = dict(getattr(account, "extra", {}) or {})
+            workspace_join_result = account_extra.get("workspace_join")
+            if isinstance(workspace_join_result, dict):
+                with workspace_ids_lock:
+                    _prune_failed_chatgpt_workspace_ids(
+                        extra,
+                        workspace_join_result.get("failed_workspace_ids") or [],
+                        logger,
+                    )
             workspace_join_error = _chatgpt_workspace_join_failure(account)
             if workspace_join_error:
+                _mark_local_ms_mailbox_event(
+                    shared_mailbox,
+                    account,
+                    "registration_failure",
+                    logger,
+                    error=workspace_join_error,
+                )
                 logger.record_error(workspace_join_error)
                 logger.log(workspace_join_error, level="error")
                 _save_task_log(platform_name, account.email, "failed", error=workspace_join_error)
                 return workspace_join_error
+            if _should_consume_mailbox_after_registration(
+                account,
+                workspace_join_required=workspace_join_required,
+            ):
+                _mark_local_ms_mailbox_event(shared_mailbox, account, "registration_success", logger)
+            else:
+                _mark_local_ms_mailbox_event(
+                    shared_mailbox,
+                    account,
+                    "registration_failure",
+                    logger,
+                    error="CPA JSON not generated",
+                )
             _mark_outlook_mailbox_event(shared_mailbox, account, "registration_success", logger)
             _auto_followup_windsurf_payment(
                 platform_name=platform_name,
@@ -1505,6 +1707,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             if resolved_proxy:
                 proxy_pool.report_fail(resolved_proxy)
             error = str(exc)
+            _release_current_mailbox_lease(shared_mailbox, logger, error=error)
             logger.record_error(error)
             logger.log(f"✗ 注册失败: {error}", level="error")
             _save_task_log(platform_name, email or "", "failed", error=error)

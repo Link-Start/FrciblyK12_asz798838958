@@ -226,6 +226,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         self.graph_scope = str(graph_scope or DEFAULT_GRAPH_SCOPE).strip()
         self.allow_reuse = bool(allow_reuse)
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
+        self._thread_local = threading.local()
 
     @classmethod
     def from_config(cls, config: dict) -> "LocalMicrosoftMailboxPool":
@@ -260,9 +261,14 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
 
     def _state(self) -> dict:
         try:
-            return json.loads(self.state_file.read_text(encoding="utf-8"))
+            state = json.loads(self.state_file.read_text(encoding="utf-8"))
         except Exception:
-            return {"used": {}}
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        state["used"] = dict(state.get("used") or {})
+        state["leased"] = dict(state.get("leased") or {})
+        return state
 
     def _save_state(self, state: dict) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -272,25 +278,26 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         material = f"{self.pool_file}\n{self.pool_text}".encode("utf-8")
         return hashlib.sha256(material).hexdigest()[:16]
 
-    def _reserve(self, entry: LocalMicrosoftMailboxEntry) -> None:
+    def _lease(self, entry: LocalMicrosoftMailboxEntry) -> None:
         if self.allow_reuse:
             return
         state = self._state()
-        used = dict(state.get("used") or {})
-        used[entry.key] = {
+        leased = dict(state.get("leased") or {})
+        leased[entry.key] = {
             "email": entry.email,
-            "reserved_at": datetime.now(timezone.utc).isoformat(),
+            "leased_at": datetime.now(timezone.utc).isoformat(),
             "source_id": self._source_id(),
         }
-        state["used"] = used
+        state["leased"] = leased
         self._save_state(state)
 
     def _available_entry(self) -> LocalMicrosoftMailboxEntry:
         entries = self._entries()
         state = self._state()
         used = set((state.get("used") or {}).keys())
+        leased = set((state.get("leased") or {}).keys())
         for entry in entries:
-            if self.allow_reuse or entry.key not in used:
+            if self.allow_reuse or (entry.key not in used and entry.key not in leased):
                 return entry
         raise RuntimeError(f"本地微软邮箱池已用尽: total={len(entries)}")
 
@@ -300,11 +307,11 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
     def get_email(self) -> MailboxAccount:
         with self._lock:
             entry = self._available_entry()
-            self._reserve(entry)
+            self._lease(entry)
 
         credentials = entry.credentials()
         credentials = {key: value for key, value in credentials.items() if value}
-        return MailboxAccount(
+        account = MailboxAccount(
             email=entry.email,
             account_id=entry.key,
             extra={
@@ -331,11 +338,64 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                     "metadata": {
                         "email": entry.email,
                         "source": entry.source_format,
-                        "reserved": not self.allow_reuse,
+                        "leased": not self.allow_reuse,
                     },
                 },
             },
         )
+        self._thread_local.account = account
+        return account
+
+    def _clear_thread_account(self, account: MailboxAccount) -> None:
+        current = getattr(self._thread_local, "account", None)
+        if current is not None and getattr(current, "email", "") == getattr(account, "email", ""):
+            self._thread_local.account = None
+
+    def mark_registration_success(self, account: MailboxAccount) -> list[str]:
+        if self.allow_reuse:
+            self._clear_thread_account(account)
+            return []
+        entry = self._entry_for_account(account)
+        with self._lock:
+            state = self._state()
+            leased = dict(state.get("leased") or {})
+            lease_info = dict(leased.pop(entry.key, {}) or {})
+            used = dict(state.get("used") or {})
+            now = datetime.now(timezone.utc).isoformat()
+            used[entry.key] = {
+                "email": entry.email,
+                "reserved_at": lease_info.get("leased_at") or now,
+                "used_at": now,
+                "source_id": self._source_id(),
+            }
+            state["leased"] = leased
+            state["used"] = used
+            self._save_state(state)
+        self._clear_thread_account(account)
+        return ["used"]
+
+    def mark_registration_failure(self, account: MailboxAccount, error: str = "") -> list[str]:
+        if self.allow_reuse:
+            self._clear_thread_account(account)
+            return []
+        entry = self._entry_for_account(account)
+        removed = False
+        with self._lock:
+            state = self._state()
+            leased = dict(state.get("leased") or {})
+            if entry.key in leased:
+                leased.pop(entry.key, None)
+                removed = True
+            state["leased"] = leased
+            self._save_state(state)
+        self._clear_thread_account(account)
+        return ["released"] if removed else []
+
+    def release_current_lease(self, error: str = "") -> list[str]:
+        account = getattr(self._thread_local, "account", None)
+        if account is None:
+            return []
+        return self.mark_registration_failure(account, error=error)
 
     def _entry_for_account(self, account: MailboxAccount) -> LocalMicrosoftMailboxEntry:
         account_email = str(getattr(account, "email", "") or "").strip().lower()

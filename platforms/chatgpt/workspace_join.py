@@ -14,6 +14,8 @@ DEFAULT_WORKSPACE_IDS = "d1869eec-4d2d-4fce-967f-a1a6b906d51e"
 
 
 def parse_workspace_ids(raw: Any) -> list[str]:
+    if isinstance(raw, (list, tuple, set)):
+        return [str(item or "").strip() for item in raw if str(item or "").strip()]
     text = str(raw or "").strip() or DEFAULT_WORKSPACE_IDS
     normalized = text.replace(",", "\n")
     return [item.strip() for item in normalized.splitlines() if item.strip()]
@@ -344,6 +346,9 @@ def run_workspace_join_flow(
         "ok": False,
         "workspace_ids": workspace_ids,
         "request_results": [],
+        "failed_workspace_ids": [],
+        "successful_workspace_ids": [],
+        "remaining_workspace_ids": workspace_ids,
         "invite_url": "",
         "accept_result": None,
         "cpa_export": None,
@@ -372,7 +377,28 @@ def run_workspace_join_flow(
             log=log,
         )
         result["request_results"] = request_results
-        result["request_ok"] = all(bool(item.get("ok")) for item in request_results)
+        successful_workspace_ids = [
+            str(item.get("workspace_id") or "").strip()
+            for item in request_results
+            if item.get("ok") and str(item.get("workspace_id") or "").strip()
+        ]
+        failed_workspace_ids = [
+            str(item.get("workspace_id") or "").strip()
+            for item in request_results
+            if not item.get("ok") and str(item.get("workspace_id") or "").strip()
+        ]
+        failed_set = set(failed_workspace_ids)
+        remaining_workspace_ids = [ws_id for ws_id in workspace_ids if ws_id not in failed_set]
+        result["successful_workspace_ids"] = successful_workspace_ids
+        result["failed_workspace_ids"] = failed_workspace_ids
+        result["remaining_workspace_ids"] = remaining_workspace_ids
+        result["request_ok"] = bool(successful_workspace_ids)
+        if failed_workspace_ids:
+            _log(
+                log,
+                "Workspace Join: removing failed workspace IDs from current candidates: "
+                + ", ".join(failed_workspace_ids),
+            )
     except Exception as exc:
         result["error"] = f"workspace request failed: {exc}"
         return {"workspace_join": result}
@@ -409,7 +435,10 @@ def run_workspace_join_flow(
     result["ok"] = bool(accept_result.get("ok"))
 
     if result.get("ok") and _bool_config(config.get("export_cpa_json"), True):
-        workspace_id = _workspace_id_from_invite_url(result["invite_url"], workspace_ids)
+        workspace_id = _workspace_id_from_invite_url(
+            result["invite_url"],
+            result.get("successful_workspace_ids") or result.get("remaining_workspace_ids") or workspace_ids,
+        )
         try:
             _log(log, "Workspace Join: start switching workspace and exporting CPA JSON")
             export_result = export_workspace_cpa_session_from_browser(

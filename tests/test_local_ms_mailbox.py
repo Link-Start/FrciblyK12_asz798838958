@@ -1,5 +1,6 @@
 from core.base_mailbox import MailboxAccount
 from core.local_ms_mailbox import LocalMicrosoftMailboxPool, parse_local_ms_pool_rows
+import json
 
 
 def test_parse_local_ms_pool_rows_accepts_gujumpgate_hotmail_format():
@@ -38,6 +39,37 @@ def test_local_ms_pool_records_gujumpgate_source_metadata(tmp_path):
     assert provider_account["credentials"]["refresh_token"] == "refresh-token-456"
     assert provider_account["metadata"]["source"] == "gujumpgate_hotmail"
     assert provider_resource["metadata"]["source"] == "gujumpgate_hotmail"
+
+
+def test_local_ms_pool_leases_until_cpa_success_and_releases_on_failure(tmp_path):
+    state_file = tmp_path / "state.json"
+    pool = LocalMicrosoftMailboxPool(
+        pool_text="\n".join(
+            [
+                "first@example.com----mail-pass----client-id-1----refresh-token-1",
+                "second@example.com----mail-pass----client-id-2----refresh-token-2",
+            ]
+        ),
+        state_file=str(state_file),
+    )
+
+    first = pool.get_email()
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert first.email == "first@example.com"
+    assert "first@example.com" in state["leased"]
+    assert state["used"] == {}
+
+    second = pool.get_email()
+    assert second.email == "second@example.com"
+
+    assert pool.mark_registration_failure(first, error="no cpa") == ["released"]
+    released = pool.get_email()
+    assert released.email == "first@example.com"
+
+    assert pool.mark_registration_success(released) == ["used"]
+    final_state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert "first@example.com" in final_state["used"]
+    assert "first@example.com" not in final_state["leased"]
 
 
 def test_graph_access_token_tries_fallback_endpoint(monkeypatch):

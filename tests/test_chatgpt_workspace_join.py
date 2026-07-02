@@ -15,6 +15,11 @@ def test_parse_workspace_ids_accepts_commas_and_lines():
     assert parse_workspace_ids(" one,\ntwo \n\n three ") == ["one", "two", "three"]
 
 
+def test_parse_workspace_ids_accepts_runtime_list_without_default():
+    assert parse_workspace_ids(["one", "two", ""]) == ["one", "two"]
+    assert parse_workspace_ids([]) == []
+
+
 def test_extract_verification_link_accepts_chatgpt_workspace_invite():
     html = """
     <a href="https://chatgpt.com/k12-invite?inv_ws_name=w&amp;wId=d1869eec-4d2d-4fce-967f-a1a6b906d51e&amp;aiId=abc">
@@ -171,6 +176,71 @@ def test_workspace_join_flow_exports_cpa_and_returns_workspace_credentials(monke
     assert result["session_token"] == "workspace-session"
     assert result["account_id"] == "workspace-account"
     assert result["workspace_join"]["cpa_export"]["path"].endswith("member.json")
+
+
+def test_workspace_join_flow_prunes_failed_workspace_and_continues(monkeypatch, tmp_path):
+    import platforms.chatgpt.workspace_join as workspace_join
+
+    captured = {}
+
+    class FakeMailbox:
+        def get_current_ids(self, _account):
+            return set()
+
+        def wait_for_link(self, *_args, **_kwargs):
+            return "https://chatgpt.com/k12-invite?wId=workspace-2&aiId=invite-2"
+
+    monkeypatch.setattr(
+        workspace_join,
+        "request_workspace_join_in_browser",
+        lambda *_args, **_kwargs: [
+            {"ok": False, "status": 404, "workspace_id": "workspace-1", "text": "closed"},
+            {"ok": True, "status": 200, "workspace_id": "workspace-2"},
+        ],
+    )
+    monkeypatch.setattr(
+        workspace_join,
+        "open_workspace_invite_in_browser",
+        lambda *_args, **_kwargs: {"ok": True, "clicked": True},
+    )
+
+    def fake_export(*_args, **kwargs):
+        captured["workspace_id"] = kwargs.get("workspace_id")
+        return {
+            "ok": True,
+            "path": str(tmp_path / "member.json"),
+            "email": "member@example.com",
+            "account_id": "workspace-account",
+            "access_token": "workspace-access",
+        }
+
+    monkeypatch.setattr(
+        workspace_join,
+        "export_workspace_cpa_session_from_browser",
+        fake_export,
+        raising=False,
+    )
+
+    result = run_workspace_join_flow(
+        object(),
+        {"access_token": "registration-access"},
+        mailbox=FakeMailbox(),
+        mailbox_account=object(),
+        config={
+            "workspace_ids": "workspace-1\nworkspace-2",
+            "accept_invite": True,
+            "export_cpa_json": True,
+            "cpa_output_dir": str(tmp_path),
+        },
+    )
+
+    workspace_result = result["workspace_join"]
+    assert workspace_result["ok"] is True
+    assert workspace_result["request_ok"] is True
+    assert workspace_result["failed_workspace_ids"] == ["workspace-1"]
+    assert workspace_result["successful_workspace_ids"] == ["workspace-2"]
+    assert workspace_result["remaining_workspace_ids"] == ["workspace-2"]
+    assert captured["workspace_id"] == "workspace-2"
 
 
 def test_workspace_join_flow_fails_when_cpa_export_fails(monkeypatch, tmp_path):

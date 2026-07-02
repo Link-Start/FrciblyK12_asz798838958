@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import html
 import logging
 import re
+import threading
 from urllib.parse import urlencode, urlparse
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ class FallbackMailbox(BaseMailbox):
     def __init__(self, providers: list[tuple[str, 'BaseMailbox']]):
         self.providers = [(str(key or "").strip(), mailbox) for key, mailbox in providers if str(key or "").strip() and mailbox]
         self._accounts: dict[str, BaseMailbox] = {}
+        self._thread_local = threading.local()
 
     @staticmethod
     def _inject_provider_metadata(account: MailboxAccount, provider_key: str) -> MailboxAccount:
@@ -84,6 +86,8 @@ class FallbackMailbox(BaseMailbox):
                 account = mailbox.get_email()
                 self._accounts[str(account.email or "").strip()] = mailbox
                 self._inject_provider_metadata(account, provider_key)
+                self._thread_local.mailbox = mailbox
+                self._thread_local.account = account
                 print(f"[Mailbox] 使用 provider 成功: {provider_key} -> {account.email}")
                 return account
             except Exception as exc:
@@ -92,6 +96,21 @@ class FallbackMailbox(BaseMailbox):
                 print(f"[Mailbox] provider 失败: {provider_key} -> {message}")
                 continue
         raise RuntimeError("所有邮箱 provider 均创建失败: " + " | ".join(errors))
+
+    def release_current_lease(self, error: str = "") -> list[str]:
+        mailbox = getattr(self._thread_local, "mailbox", None)
+        account = getattr(self._thread_local, "account", None)
+        if mailbox is None:
+            return []
+        release = getattr(mailbox, "release_current_lease", None)
+        if callable(release):
+            applied = release(error=error)
+        else:
+            marker = getattr(mailbox, "mark_registration_failure", None)
+            applied = marker(account, error=error) if callable(marker) and account is not None else []
+        self._thread_local.mailbox = None
+        self._thread_local.account = None
+        return list(applied or [])
 
     def get_current_ids(self, account: MailboxAccount) -> set:
         return self._resolve_mailbox(account).get_current_ids(account)

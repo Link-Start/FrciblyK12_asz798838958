@@ -183,6 +183,59 @@ def test_chatgpt_register_task_fails_when_workspace_join_fails(monkeypatch):
     assert not any(event[0] == "success" for event in logger.events)
 
 
+def test_chatgpt_workspace_join_requires_cpa_export_before_consuming_mailbox():
+    no_cpa = Account(
+        platform="chatgpt",
+        email="member@example.com",
+        password="Secret123!",
+        extra={
+            "workspace_join": {
+                "ok": False,
+                "error": "CPA JSON export failed: workspace switch failed",
+                "cpa_export": {"ok": False, "error": "workspace switch failed"},
+            }
+        },
+    )
+    with_cpa = Account(
+        platform="chatgpt",
+        email="member@example.com",
+        password="Secret123!",
+        extra={
+            "workspace_join": {
+                "ok": True,
+                "cpa_export": {"ok": True, "path": "D:/exports/member.json"},
+            }
+        },
+    )
+
+    assert tasks_module._should_consume_mailbox_after_registration(
+        no_cpa,
+        workspace_join_required=True,
+    ) is False
+    assert tasks_module._should_consume_mailbox_after_registration(
+        with_cpa,
+        workspace_join_required=True,
+    ) is True
+
+
+def test_prune_failed_workspace_ids_from_task_extra():
+    extra = {
+        "chatgpt_workspace_join": {
+            "workspace_ids": "workspace-1\nworkspace-2\nworkspace-3",
+        }
+    }
+    logger = _FakeLogger()
+
+    tasks_module._prune_failed_chatgpt_workspace_ids(
+        extra,
+        ["workspace-1", "workspace-3"],
+        logger,
+    )
+
+    assert extra["chatgpt_workspace_join"]["workspace_ids"] == ["workspace-2"]
+    assert any("workspace-1" in event[1] for event in logger.events if event[0] == "log")
+
+
 def test_phone_bind_task_passes_logger_and_browser_mode(monkeypatch):
     seen = {}
 
