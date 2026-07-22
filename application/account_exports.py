@@ -8,6 +8,9 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from urllib.parse import urlparse
+
+import requests
 
 from core.datetime_utils import serialize_datetime
 from domain.accounts import AccountExportSelection, AccountRecord
@@ -244,6 +247,35 @@ def _make_agent_identity_sub2api_json(item: AccountRecord) -> dict:
         return certificate_to_sub2api_export(certificate)
     except AgentIdentityError as exc:
         raise ValueError(f"账号 {item.email} 注册 Agent Identity 失败：{exc}") from exc
+
+
+def _sub2api_agent_identity_import_entry(item: AccountRecord) -> dict:
+    """Build the compact Agent Identity shape accepted by current Sub2API."""
+
+    exported = _make_agent_identity_sub2api_json(item)
+    identity = exported.get("agent_identity")
+    if not isinstance(identity, dict):
+        raise ValueError(f"账号 {item.email} 的 Agent Identity 导出格式无效")
+    return {
+        "auth_mode": "agentIdentity",
+        "agent_identity": identity,
+    }
+
+
+def _sub2api_codex_import_url(base_url: str) -> str:
+    cleaned = str(base_url or "").strip().rstrip("/")
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Sub2API 地址必须是完整的 http:// 或 https:// 地址")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("Sub2API 地址不能包含账号、查询参数或片段")
+
+    endpoint = "/api/v1/admin/accounts/import/codex-session"
+    if cleaned.endswith(endpoint):
+        return cleaned
+    if cleaned.endswith("/api/v1"):
+        return cleaned + "/admin/accounts/import/codex-session"
+    return cleaned + endpoint
 
 
 def _make_cockpit_token(item: AccountRecord) -> dict:
@@ -534,6 +566,56 @@ class AccountExportsService:
             media_type="application/zip",
             content=buffer,
         )
+
+    def upload_chatgpt_agent_identity_to_sub2api(
+        self,
+        selection: AccountExportSelection,
+        *,
+        sub2api_url: str,
+        api_key: str,
+    ) -> dict:
+        key = str(api_key or "").strip()
+        if not key:
+            raise ValueError("缺少 Sub2API Admin API Key")
+        endpoint = _sub2api_codex_import_url(sub2api_url)
+        entries = [
+            _sub2api_agent_identity_import_entry(item)
+            for item in self._load_chatgpt_items(selection)
+        ]
+        payload = {
+            # Sub2API accepts each JSON string as an independent import item.
+            "contents": [json.dumps(item, ensure_ascii=False) for item in entries],
+            "update_existing": True,
+        }
+        try:
+            response = requests.post(
+                endpoint,
+                headers={
+                    "X-API-Key": key,
+                    "Accept": "application/json",
+                },
+                json=payload,
+                timeout=60,
+            )
+        except requests.RequestException as exc:
+            raise ValueError(f"Sub2API 上传请求失败：{exc}") from exc
+
+        if response.status_code < 200 or response.status_code >= 300:
+            try:
+                detail = response.json()
+            except ValueError:
+                detail = response.text[:500]
+            raise ValueError(f"Sub2API 上传失败（HTTP {response.status_code}）：{detail}")
+
+        try:
+            result = response.json()
+        except ValueError:
+            result = {"message": response.text[:500]}
+        return {
+            "submitted": len(entries),
+            "endpoint": endpoint,
+            "result": result,
+        }
 
     def export_chatgpt_cpa(self, selection: AccountExportSelection) -> ExportArtifact:
         items = self._load_chatgpt_items(selection)

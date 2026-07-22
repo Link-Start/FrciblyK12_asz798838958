@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 
 from platforms.chatgpt.constants import CHATGPT_APP, OPENAI_API_ENDPOINTS, SENTINEL_REQ_URL
 from platforms.chatgpt.plugin import ChatGPTPlatform
-from platforms.chatgpt.protocol_register import ChatGPTProtocolRegister, OpenAISentinelClient
+from platforms.chatgpt.protocol_register import (
+    ChatGPTProtocolRegister,
+    OpenAISentinelClient,
+    _SentinelBrowserRuntime,
+)
 
 
 class _FakeCookies:
@@ -157,3 +163,94 @@ def test_sentinel_headers_include_vm_and_session_observer_tokens():
     so_token = json.loads(headers["openai-sentinel-so-token"])
     assert token["t"] == "turnstile-proof"
     assert so_token["so"] == "observer-proof"
+
+
+def test_sentinel_runtime_uses_camoufox_and_releases_it(monkeypatch):
+    events = []
+
+    class _Page:
+        def goto(self, *_args, **_kwargs):
+            events.append("goto")
+
+        def evaluate(self, expression, *_args):
+            if expression == "typeof window.SentinelSDK":
+                return "object"
+            return None
+
+    class _Browser:
+        def new_page(self):
+            return _Page()
+
+    class _Camoufox:
+        options = None
+
+        def __init__(self, **options):
+            type(self).options = options
+
+        def __enter__(self):
+            events.append("enter")
+            return _Browser()
+
+        def __exit__(self, *_args):
+            events.append("exit")
+
+    class _Session:
+        def get(self, *_args, **_kwargs):
+            return _FakeResponse(text="before t.token=ye,t}({}); after")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "camoufox.sync_api",
+        types.SimpleNamespace(Camoufox=_Camoufox),
+    )
+    monkeypatch.setattr(_SentinelBrowserRuntime, "_sdk_code", None)
+
+    runtime = _SentinelBrowserRuntime.create(
+        _Session(),
+        user_agent="unused-by-camoufox",
+        proxy="http://name:pass@127.0.0.1:8080",
+    )
+    assert _Camoufox.options["headless"] is True
+    assert _Camoufox.options["block_webrtc"] is True
+    assert _Camoufox.options["proxy"] == {
+        "server": "http://127.0.0.1:8080",
+        "username": "name",
+        "password": "pass",
+    }
+
+    runtime.close()
+    runtime.close()
+    assert events.count("enter") == 1
+    assert events.count("exit") == 1
+
+
+def test_sentinel_runtime_releases_failed_camoufox_startup(monkeypatch):
+    events = []
+
+    class _Camoufox:
+        def __init__(self, **_options):
+            pass
+
+        def __enter__(self):
+            events.append("enter")
+            raise RuntimeError("Camoufox startup failed")
+
+        def __exit__(self, *_args):
+            events.append("exit")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "camoufox.sync_api",
+        types.SimpleNamespace(Camoufox=_Camoufox),
+    )
+
+    try:
+        _SentinelBrowserRuntime.create(
+            object(), user_agent="unused-by-camoufox", proxy=None
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "Camoufox startup failed"
+    else:
+        raise AssertionError("expected Camoufox startup error")
+
+    assert events == ["enter", "exit"]

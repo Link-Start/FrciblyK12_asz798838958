@@ -203,11 +203,10 @@ function RegisterModal({
   const [concurrency, setConcurrency] = useState(1)
   const [dynamicProxy, setDynamicProxy] = useState('')
   const [outlookPoolText, setOutlookPoolText] = useState('')
-  const [autoDownloadAgentIdentity, setAutoDownloadAgentIdentity] = useState(false)
-  const [agentIdentityDownload, setAgentIdentityDownload] = useState<{
-    state: 'idle' | 'exporting' | 'success' | 'error'
-    message: string
-  }>({ state: 'idle', message: '' })
+  const [autoUploadSub2Api, setAutoUploadSub2Api] = useState(false)
+  const [sub2ApiConfigOpen, setSub2ApiConfigOpen] = useState(false)
+  const [sub2ApiUrl, setSub2ApiUrl] = useState('http://127.0.0.1:8080')
+  const [sub2ApiApiKey, setSub2ApiApiKey] = useState('')
   const [startError, setStartError] = useState('')
   const [selection, setSelection] = useState({
     identityProvider: 'mailbox',
@@ -216,7 +215,6 @@ function RegisterModal({
   const [taskId, setTaskId] = useState<string | null>(null)
   const [done, setDone] = useState(false)
   const [starting, setStarting] = useState(false)
-  const autoDownloadStartedRef = useRef(false)
 
   const supportedExecutors: string[] = platformMeta?.supported_executors || []
   const registrationOptions = buildRegistrationOptions(platformMeta, language)
@@ -314,12 +312,14 @@ function RegisterModal({
   const start = async () => {
     setStarting(true)
     setStartError('')
-    autoDownloadStartedRef.current = false
-    setAgentIdentityDownload({ state: 'idle', message: '' })
     try {
+      if (autoUploadSub2Api && (!sub2ApiUrl.trim() || !sub2ApiApiKey.trim())) {
+        setSub2ApiConfigOpen(true)
+        throw new Error(t('accounts.sub2ApiConfigRequired'))
+      }
       const extra: Record<string, any> = {
         identity_provider: selection.identityProvider,
-        auto_download_agent_identity: autoDownloadAgentIdentity,
+        auto_upload_sub2api_agent_identity: autoUploadSub2Api,
       }
       if (selection.identityProvider === 'mailbox') {
         if (selection.executorType === 'protocol') {
@@ -342,6 +342,8 @@ function RegisterModal({
           executor_type: selection.executorType,
           captcha_solver: 'auto',
           proxy: dynamicProxy.trim() || null,
+          sub2api_url: autoUploadSub2Api ? sub2ApiUrl.trim() : null,
+          sub2api_api_key: autoUploadSub2Api ? sub2ApiApiKey.trim() : null,
           extra,
         }),
       })
@@ -351,54 +353,9 @@ function RegisterModal({
     } finally { setStarting(false) }
   }
 
-  const handleDone = async (status: string) => {
+  const handleDone = (_status: string) => {
     setDone(true)
     onDone()
-
-    if (
-      !autoDownloadAgentIdentity ||
-      status !== 'succeeded' ||
-      !taskId ||
-      autoDownloadStartedRef.current
-    ) {
-      return
-    }
-
-    autoDownloadStartedRef.current = true
-    setAgentIdentityDownload({
-      state: 'exporting',
-      message: t('accounts.agentIdentityExporting'),
-    })
-    try {
-      const task = await apiFetch(`/tasks/${taskId}`)
-      const accountIds = task?.data?.account_ids || task?.result?.data?.account_ids || []
-      if (!Array.isArray(accountIds) || accountIds.length === 0) {
-        throw new Error(t('accounts.agentIdentityNoSuccessfulAccounts'))
-      }
-
-      const { blob, filename } = await apiDownload(
-        '/accounts/export/sub2api-agent-identity',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            platform: 'chatgpt',
-            ids: accountIds,
-            select_all: false,
-          }),
-        },
-      )
-      triggerBrowserDownload(blob, filename)
-      setAgentIdentityDownload({
-        state: 'success',
-        message: t('accounts.agentIdentityExported'),
-      })
-    } catch (error: any) {
-      const detail = error?.message || String(error)
-      setAgentIdentityDownload({
-        state: 'error',
-        message: `${t('accounts.agentIdentityExportFailed')}: ${detail}`,
-      })
-    }
   }
 
   const dialog = (
@@ -487,6 +444,9 @@ function RegisterModal({
                     <div className="mb-2 text-xs text-[var(--text-muted)]">
                       {t('accounts.outlookPoolHint')}
                     </div>
+                    <div className="mb-2 text-xs text-sky-300">
+                      {t('accounts.outlookAliasHint')}
+                    </div>
                     <textarea
                       value={outlookPoolText}
                       onChange={(event) => setOutlookPoolText(event.target.value)}
@@ -498,22 +458,37 @@ function RegisterModal({
                   </div>
                 ) : null}
 
-                <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 px-4 py-3">
-                  <input
-                    type="checkbox"
-                    checked={autoDownloadAgentIdentity}
-                    onChange={(event) => setAutoDownloadAgentIdentity(event.target.checked)}
-                    className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
-                  />
-                  <span>
-                    <span className="block text-sm font-medium text-[var(--text-primary)]">
-                      {t('accounts.autoDownloadAgentIdentity')}
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 px-4 py-3">
+                  <label className="flex cursor-pointer items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked={autoUploadSub2Api}
+                      onChange={(event) => {
+                        const enabled = event.target.checked
+                        setAutoUploadSub2Api(enabled)
+                        if (enabled) setSub2ApiConfigOpen(true)
+                      }}
+                      className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
+                    />
+                    <span>
+                      <span className="block text-sm font-medium text-[var(--text-primary)]">
+                        {t('accounts.autoUploadSub2Api')}
+                      </span>
+                      <span className="mt-1 block text-xs text-[var(--text-muted)]">
+                        {t('accounts.autoUploadSub2ApiHint')}
+                      </span>
                     </span>
-                    <span className="mt-1 block text-xs text-[var(--text-muted)]">
-                      {t('accounts.autoDownloadAgentIdentityHint')}
-                    </span>
-                  </span>
-                </label>
+                  </label>
+                  {autoUploadSub2Api ? (
+                    <button
+                      type="button"
+                      onClick={() => setSub2ApiConfigOpen(true)}
+                      className="mt-3 text-xs text-[var(--accent)] hover:underline"
+                    >
+                      {t('accounts.configureSub2Api')}
+                    </button>
+                  ) : null}
+                </div>
 
                 <div className="grid grid-cols-2 gap-3">
                   <div>
@@ -524,7 +499,7 @@ function RegisterModal({
                   </div>
                   <div>
                     <label className="text-xs text-[var(--text-muted)] block mb-1">{t('accounts.concurrency')}</label>
-                    <input type="number" min={1} max={5} value={concurrency}
+                    <input type="number" min={1} max={20} value={concurrency}
                       onChange={e => setConcurrency(Number(e.target.value))}
                       className="control-surface control-surface-compact text-center" />
                   </div>
@@ -564,7 +539,7 @@ function RegisterModal({
 
                 <Button
                   onClick={start}
-                  disabled={starting || !selection.identityProvider || !selection.executorType || (selection.executorType === 'protocol' && !outlookPoolText.trim())}
+                  disabled={starting || !selection.identityProvider || !selection.executorType || (selection.executorType === 'protocol' && !outlookPoolText.trim()) || (autoUploadSub2Api && (!sub2ApiUrl.trim() || !sub2ApiApiKey.trim()))}
                   className="w-full"
                 >
                   {starting ? t('accounts.starting') : t('accounts.startAutoRegister')}
@@ -576,17 +551,6 @@ function RegisterModal({
               <div className="min-h-0 flex-1">
                 <TaskLogPanel taskId={taskId} onDone={handleDone} />
               </div>
-              {agentIdentityDownload.state !== 'idle' ? (
-                <div className={`rounded-lg border px-3 py-2 text-xs ${
-                  agentIdentityDownload.state === 'success'
-                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-                    : agentIdentityDownload.state === 'error'
-                      ? 'border-red-500/30 bg-red-500/10 text-red-300'
-                      : 'border-sky-500/30 bg-sky-500/10 text-sky-300'
-                }`}>
-                  {agentIdentityDownload.message}
-                </div>
-              ) : null}
             </div>
           )}
         </div>
@@ -596,6 +560,63 @@ function RegisterModal({
           </Button>
         </div>
       </div>
+      {sub2ApiConfigOpen ? (
+        <div
+          className="fixed inset-0 z-[120] flex items-center justify-center bg-black/60 p-4"
+          onClick={(event) => {
+            event.stopPropagation()
+            setSub2ApiConfigOpen(false)
+          }}
+        >
+          <div
+            className="w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-5 shadow-xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3 className="text-base font-semibold text-[var(--text-primary)]">
+              {t('accounts.sub2ApiConfigTitle')}
+            </h3>
+            <p className="mt-1 text-xs text-[var(--text-muted)]">
+              {t('accounts.sub2ApiConfigHint')}
+            </p>
+            <label className="mt-4 block text-xs text-[var(--text-muted)]">
+              {t('accounts.sub2ApiUrl')}
+              <input
+                type="url"
+                value={sub2ApiUrl}
+                onChange={(event) => setSub2ApiUrl(event.target.value)}
+                placeholder="http://127.0.0.1:8080"
+                className="control-surface control-surface-compact mt-1 w-full font-mono text-xs"
+              />
+            </label>
+            <label className="mt-3 block text-xs text-[var(--text-muted)]">
+              {t('accounts.sub2ApiAdminApiKey')}
+              <input
+                type="password"
+                value={sub2ApiApiKey}
+                onChange={(event) => setSub2ApiApiKey(event.target.value)}
+                autoComplete="off"
+                placeholder="sk-..."
+                className="control-surface control-surface-compact mt-1 w-full font-mono text-xs"
+              />
+            </label>
+            <div className="mt-2 text-xs text-[var(--text-muted)]">
+              {t('accounts.sub2ApiApiKeyHint')}
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <Button variant="outline" size="sm" onClick={() => setSub2ApiConfigOpen(false)}>
+                {t('common.cancel')}
+              </Button>
+              <Button
+                size="sm"
+                disabled={!sub2ApiUrl.trim() || !sub2ApiApiKey.trim()}
+                onClick={() => setSub2ApiConfigOpen(false)}
+              >
+                {t('accounts.saveSub2ApiConfig')}
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 

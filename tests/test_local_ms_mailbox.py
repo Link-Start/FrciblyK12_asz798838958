@@ -63,6 +63,51 @@ def test_local_ms_pool_records_gujumpgate_source_metadata(tmp_path):
     assert provider_resource["metadata"]["source"] == "gujumpgate_hotmail"
 
 
+def test_local_ms_pool_allocates_six_outlook_child_addresses_per_parent(tmp_path):
+    pool = LocalMicrosoftMailboxPool(
+        pool_text="parent@outlook.com----mail-pass----client-id----refresh-token",
+        state_file=str(tmp_path / "state.json"),
+        alias_count=6,
+    )
+
+    accounts = [pool.get_email() for _ in range(6)]
+
+    assert [item.email for item in accounts] == [
+        f"parent+reg{index}@outlook.com" for index in range(1, 7)
+    ]
+    assert {item.account_id for item in accounts} == {
+        f"parent@outlook.com#sub-{index}" for index in range(1, 7)
+    }
+    assert all(
+        item.extra["provider_account"]["credentials"]["email"] == "parent@outlook.com"
+        for item in accounts
+    )
+    assert all(
+        item.extra["provider_resource"]["metadata"]["parent_email"] == "parent@outlook.com"
+        for item in accounts
+    )
+
+    try:
+        pool.get_email()
+    except RuntimeError as exc:
+        assert "已用尽" in str(exc)
+    else:
+        raise AssertionError("the seventh child address should not be allocated")
+
+
+def test_child_mailbox_otp_filter_matches_only_the_assigned_recipient():
+    account = MailboxAccount(email="parent+reg2@outlook.com")
+
+    assert LocalMicrosoftMailboxPool._message_is_for_account(
+        {"toRecipients": [{"emailAddress": {"address": "parent+reg2@outlook.com"}}]},
+        account,
+    )
+    assert not LocalMicrosoftMailboxPool._message_is_for_account(
+        {"toRecipients": [{"emailAddress": {"address": "parent+reg1@outlook.com"}}]},
+        account,
+    )
+
+
 def test_graph_access_token_tries_fallback_endpoint(monkeypatch):
     calls = []
 

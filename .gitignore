@@ -69,6 +69,11 @@ AGENTS.md
 .windsurf/
 docs/REFACTOR-PLAN.md
 
+# Local Codex/tooling artifacts and ad-hoc source bundles
+/.codex-test-tmp/
+/.tools/
+/*.zip
+
 # 敏感文件
 *.har
 

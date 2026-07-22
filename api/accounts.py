@@ -46,6 +46,11 @@ class BatchExportRequest(BaseModel):
     search_filter: Optional[str] = None
 
 
+class Sub2ApiAgentIdentityUploadRequest(BatchExportRequest):
+    sub2api_url: str = Field(min_length=1)
+    api_key: str = Field(min_length=1)
+
+
 def _stream_artifact(artifact: ExportArtifact) -> StreamingResponse:
     if isinstance(artifact.content, io.BytesIO):
         body = artifact.content
@@ -142,6 +147,24 @@ def export_accounts_sub2api_agent_identity(body: BatchExportRequest):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return _stream_artifact(artifact)
+
+
+@router.post("/upload/sub2api-agent-identity")
+def upload_accounts_sub2api_agent_identity(body: Sub2ApiAgentIdentityUploadRequest):
+    try:
+        return exports_service.upload_chatgpt_agent_identity_to_sub2api(
+            AccountExportSelection(
+                platform=body.platform,
+                ids=body.ids,
+                select_all=body.select_all,
+                status_filter=body.status_filter or "",
+                search_filter=body.search_filter or "",
+            ),
+            sub2api_url=body.sub2api_url,
+            api_key=body.api_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.post("/export/cpa")

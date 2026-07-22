@@ -327,6 +327,69 @@ def test_export_agent_identity_sub2api_falls_back_to_access_token_claims(monkeyp
     assert payload["accounts"][0]["credentials"]["auth_mode"] == "agentIdentity"
 
 
+def test_upload_agent_identity_to_sub2api_uses_admin_import_endpoint(monkeypatch):
+    id_token = _make_jwt({
+        "email": "upload-identity@test.com",
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acct-upload",
+            "chatgpt_user_id": "user-upload",
+            "chatgpt_plan_type": "free",
+        },
+    })
+    save_account(
+        Account(
+            platform="chatgpt",
+            email="upload-identity@test.com",
+            password="TestPass123!",
+            extra={"access_token": _make_jwt({"exp": 1777166030}), "id_token": id_token},
+        )
+    )
+
+    monkeypatch.setattr(
+        "platforms.chatgpt.from_credentials.register_identity",
+        lambda *args, **kwargs: {
+            "private_key_seed": base64.b64encode(b"z" * 32).decode("ascii"),
+            "agent_runtime_id": "runtime-upload",
+            "task_id": "task-upload",
+            "account_id": "acct-upload",
+            "chatgpt_user_id": "user-upload",
+            "email": "upload-identity@test.com",
+            "plan_type": "free",
+            "chatgpt_account_is_fedramp": False,
+        },
+    )
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"success": True, "data": {"created": 1}}
+
+    def fake_post(url, *, headers, json, timeout):
+        captured.update({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        return FakeResponse()
+
+    monkeypatch.setattr("application.account_exports.requests.post", fake_post)
+    result = AccountExportsService(AccountsRepository()).upload_chatgpt_agent_identity_to_sub2api(
+        AccountExportSelection(platform="chatgpt", select_all=True),
+        sub2api_url="https://sub2api.example/api/v1",
+        api_key="admin-key",
+    )
+
+    assert captured["url"] == "https://sub2api.example/api/v1/admin/accounts/import/codex-session"
+    assert captured["headers"]["X-API-Key"] == "admin-key"
+    assert captured["timeout"] == 60
+    assert len(captured["json"]["contents"]) == 1
+    imported = json.loads(captured["json"]["contents"][0])
+    assert imported["auth_mode"] == "agentIdentity"
+    assert imported["agent_identity"]["agent_runtime_id"] == "runtime-upload"
+    assert imported["agent_identity"]["account_id"] == "acct-upload"
+    assert result["submitted"] == 1
+    assert result["result"]["data"]["created"] == 1
+
+
 def test_export_agent_identity_sub2api_requires_identity_claims():
     save_account(
         Account(

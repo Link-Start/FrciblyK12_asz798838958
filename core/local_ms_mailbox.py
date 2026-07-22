@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.header import decode_header
+from email.utils import getaddresses
 from pathlib import Path
 
 import requests
@@ -34,6 +35,7 @@ GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/mess
 DEFAULT_GRAPH_SCOPE = "offline_access https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/User.Read"
 GRAPH_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
 DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / ".local_ms_mailbox_pool_state.json"
+MAX_OUTLOOK_SUBADDRESS_COUNT = 6
 
 
 @dataclass(frozen=True)
@@ -89,8 +91,25 @@ class LocalMicrosoftMailboxEntry:
         }
 
 
+@dataclass(frozen=True)
+class LocalMicrosoftMailboxCandidate:
+    """A reservation from a parent Outlook mailbox, optionally via plus addressing."""
+
+    entry: LocalMicrosoftMailboxEntry
+    email: str
+    key: str
+    alias_index: int = 0
+
+
 def _truthy(value: object) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _bounded_alias_count(value: object) -> int:
+    try:
+        return min(max(int(value or 1), 1), MAX_OUTLOOK_SUBADDRESS_COUNT)
+    except (TypeError, ValueError):
+        return 1
 
 
 def _safe_text(value: object) -> str:
@@ -218,6 +237,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         state_file: str = "",
         graph_scope: str = "",
         allow_reuse: bool = False,
+        alias_count: int = 1,
         proxy: str = None,
     ):
         self.pool_text = str(pool_text or "")
@@ -225,6 +245,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         self.state_file = Path(state_file or DEFAULT_STATE_FILE)
         self.graph_scope = str(graph_scope or DEFAULT_GRAPH_SCOPE).strip()
         self.allow_reuse = bool(allow_reuse)
+        self.alias_count = _bounded_alias_count(alias_count)
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
 
     @classmethod
@@ -235,6 +256,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             state_file=config.get("local_ms_pool_state_file", ""),
             graph_scope=config.get("local_ms_graph_scope", ""),
             allow_reuse=_truthy(config.get("local_ms_pool_allow_reuse")),
+            alias_count=config.get("local_ms_pool_alias_count", 1),
             proxy=config.get("proxy") or None,
         )
 
@@ -272,64 +294,99 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         material = f"{self.pool_file}\n{self.pool_text}".encode("utf-8")
         return hashlib.sha256(material).hexdigest()[:16]
 
-    def _reserve(self, entry: LocalMicrosoftMailboxEntry) -> None:
+    def _candidate_email(self, entry: LocalMicrosoftMailboxEntry, alias_index: int) -> str:
+        if self.alias_count <= 1:
+            return entry.email
+        local_part, separator, domain = entry.email.strip().rpartition("@")
+        if not separator or not local_part or not domain:
+            raise RuntimeError(f"Outlook 邮箱格式无效，无法生成子邮箱: {entry.email}")
+        # Microsoft Outlook plus addressing delivers local+tag@domain into the
+        # parent mailbox.  Strip a pre-existing tag so all six child addresses
+        # consistently point to the same parent inbox.
+        parent_local_part = local_part.split("+", 1)[0]
+        return f"{parent_local_part}+reg{alias_index}@{domain}"
+
+    def _candidates(self) -> list[LocalMicrosoftMailboxCandidate]:
+        candidates: list[LocalMicrosoftMailboxCandidate] = []
+        for entry in self._entries():
+            for alias_index in range(1, self.alias_count + 1):
+                email = self._candidate_email(entry, alias_index)
+                key = entry.key if self.alias_count <= 1 else f"{entry.key}#sub-{alias_index}"
+                candidates.append(
+                    LocalMicrosoftMailboxCandidate(
+                        entry=entry,
+                        email=email,
+                        key=key,
+                        alias_index=alias_index if self.alias_count > 1 else 0,
+                    )
+                )
+        return candidates
+
+    def _reserve(self, candidate: LocalMicrosoftMailboxCandidate) -> None:
         if self.allow_reuse:
             return
         state = self._state()
         used = dict(state.get("used") or {})
-        used[entry.key] = {
-            "email": entry.email,
+        used[candidate.key] = {
+            "email": candidate.email,
+            "parent_email": candidate.entry.email,
+            "alias_index": candidate.alias_index,
             "reserved_at": datetime.now(timezone.utc).isoformat(),
             "source_id": self._source_id(),
         }
         state["used"] = used
         self._save_state(state)
 
-    def _available_entry(self) -> LocalMicrosoftMailboxEntry:
-        entries = self._entries()
+    def _available_candidate(self) -> LocalMicrosoftMailboxCandidate:
+        candidates = self._candidates()
         state = self._state()
         used = set((state.get("used") or {}).keys())
-        for entry in entries:
-            if self.allow_reuse or entry.key not in used:
-                return entry
-        raise RuntimeError(f"本地微软邮箱池已用尽: total={len(entries)}")
+        for candidate in candidates:
+            if self.allow_reuse or candidate.key not in used:
+                return candidate
+        raise RuntimeError(f"本地微软邮箱池已用尽: total={len(candidates)}")
 
     def peek_email(self) -> str:
-        return self._available_entry().email
+        return self._available_candidate().email
 
     def get_email(self) -> MailboxAccount:
         with self._lock:
-            entry = self._available_entry()
-            self._reserve(entry)
+            candidate = self._available_candidate()
+            self._reserve(candidate)
 
+        entry = candidate.entry
         credentials = entry.credentials()
         credentials = {key: value for key, value in credentials.items() if value}
         return MailboxAccount(
-            email=entry.email,
-            account_id=entry.key,
+            email=candidate.email,
+            account_id=candidate.key,
             extra={
                 "provider_account": {
                     "provider_type": "mailbox",
                     "provider_name": "local_ms_pool",
                     "login_identifier": entry.login_account or entry.email,
-                    "display_name": entry.email,
+                    "display_name": candidate.email,
                     "credentials": credentials,
                     "metadata": {
                         "source": entry.source_format,
                         "source_format": entry.source_format,
                         "has_graph_refresh_token": bool(entry.graph_ready),
                         "has_imap_config": bool(entry.imap_ready),
+                        "parent_email": entry.email,
+                        "alias_index": candidate.alias_index,
                     },
                 },
                 "provider_resource": {
                     "provider_type": "mailbox",
                     "provider_name": "local_ms_pool",
                     "resource_type": "mailbox",
-                    "resource_identifier": entry.key,
-                    "handle": entry.email,
-                    "display_name": entry.email,
+                    "resource_identifier": candidate.key,
+                    "handle": candidate.email,
+                    "display_name": candidate.email,
                     "metadata": {
-                        "email": entry.email,
+                        "email": candidate.email,
+                        "parent_email": entry.email,
+                        "alias_index": candidate.alias_index,
                         "source": entry.source_format,
                         "reserved": not self.allow_reuse,
                     },
@@ -360,10 +417,18 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 source_format=str(metadata.get("source") or metadata.get("source_format") or ""),
             )
 
+        account_parent_key = self._parent_email_key(account_email)
         for entry in self._entries():
-            if entry.key == account_email:
+            if entry.key == account_email or self._parent_email_key(entry.email) == account_parent_key:
                 return entry
         raise RuntimeError(f"本地微软邮箱池未找到账号: {getattr(account, 'email', '')}")
+
+    @staticmethod
+    def _parent_email_key(email: str) -> str:
+        local_part, separator, domain = str(email or "").strip().lower().rpartition("@")
+        if not separator:
+            return str(email or "").strip().lower()
+        return f"{local_part.split('+', 1)[0]}@{domain}"
 
     @staticmethod
     def _decode_mime(value: str) -> str:
@@ -390,6 +455,39 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 body.get("content") if isinstance(body, dict) else "",
             )
         )
+
+    @staticmethod
+    def _message_recipients(mail: dict) -> set[str]:
+        recipients: set[str] = set()
+        raw_recipients = mail.get("toRecipients")
+        if isinstance(raw_recipients, list):
+            for recipient in raw_recipients:
+                if not isinstance(recipient, dict):
+                    continue
+                address = recipient.get("emailAddress")
+                if isinstance(address, dict):
+                    value = str(address.get("address") or "").strip().lower()
+                    if value:
+                        recipients.add(value)
+        raw_to = str(mail.get("to") or "").strip()
+        if raw_to:
+            recipients.update(
+                address.strip().lower()
+                for _, address in getaddresses([raw_to])
+                if address.strip()
+            )
+        return recipients
+
+    @classmethod
+    def _message_is_for_account(cls, mail: dict, account: MailboxAccount) -> bool:
+        target = str(getattr(account, "email", "") or "").strip().lower()
+        # Parent mailboxes are not shared.  Child addresses are, so only accept
+        # a message explicitly sent to that child and never steal another
+        # concurrent registration's OTP.
+        if not target or "+" not in target.partition("@")[0]:
+            return True
+        recipients = cls._message_recipients(mail)
+        return target in recipients
 
     def _graph_access_token(self, entry: LocalMicrosoftMailboxEntry) -> str:
         if not entry.graph_ready:
@@ -489,6 +587,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                     "id": str(msg.get("Message-ID") or mid.decode("ascii", errors="ignore")),
                     "subject": subject,
                     "bodyPreview": " ".join(parts),
+                    "to": str(msg.get("To", "") or ""),
                 })
         finally:
             try:
@@ -505,7 +604,11 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
 
     def get_current_ids(self, account: MailboxAccount) -> set:
         try:
-            return {self._message_id(mail) for mail in self._messages(account) if self._message_id(mail)}
+            return {
+                self._message_id(mail)
+                for mail in self._messages(account)
+                if self._message_is_for_account(mail, account) and self._message_id(mail)
+            }
         except Exception:
             return set()
 
@@ -530,6 +633,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         start = time.time()
         while time.time() - start < timeout:
             for mail in self._messages(account):
+                if not self._message_is_for_account(mail, account):
+                    continue
                 mid = self._message_id(mail)
                 if mid and mid in seen:
                     continue
@@ -555,6 +660,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         start = time.time()
         while time.time() - start < timeout:
             for mail in self._messages(account):
+                if not self._message_is_for_account(mail, account):
+                    continue
                 mid = self._message_id(mail)
                 if mid and mid in seen:
                     continue

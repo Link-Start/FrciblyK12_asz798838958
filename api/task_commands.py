@@ -22,13 +22,25 @@ class RegisterTaskRequest(BaseModel):
     proxy: Optional[str] = None
     executor_type: Literal["protocol", "headless", "headed"] = "headless"
     captcha_solver: str = "auto"
+    sub2api_url: Optional[str] = None
+    sub2api_api_key: Optional[str] = None
     extra: dict = Field(default_factory=dict)
 
 
 @router.post("/register")
 def create_register_task(body: RegisterTaskRequest):
-    payload = body.model_dump()
+    payload = body.model_dump(exclude={"sub2api_url", "sub2api_api_key"})
     extra = dict(body.extra or {})
+    upload_config = None
+    if bool(extra.get("auto_upload_sub2api_agent_identity")):
+        sub2api_url = str(body.sub2api_url or "").strip()
+        sub2api_api_key = str(body.sub2api_api_key or "").strip()
+        if not sub2api_url or not sub2api_api_key:
+            raise HTTPException(400, "自动上传 Sub2API 需要地址和 Admin API Key")
+        upload_config = {
+            "sub2api_url": sub2api_url,
+            "api_key": sub2api_api_key,
+        }
     extra["identity_provider"] = "mailbox"
     mail_provider = str(extra.get("mail_provider") or "").strip()
     if body.executor_type == "protocol":
@@ -36,6 +48,11 @@ def create_register_task(body: RegisterTaskRequest):
         pool_file = str(extra.get("local_ms_pool_file") or "").strip()
         if not pool_text and not pool_file:
             raise HTTPException(400, "协议注册需要 Outlook 账号池文本或账号池文件")
+        from core.local_ms_mailbox import MAX_OUTLOOK_SUBADDRESS_COUNT
+
+        # Protocol registration uses Outlook plus addressing.  Each parent
+        # mailbox yields six independently reserved child addresses.
+        extra["local_ms_pool_alias_count"] = MAX_OUTLOOK_SUBADDRESS_COUNT
         if pool_text:
             from core.local_ms_mailbox import parse_local_ms_pool_rows
 
@@ -45,16 +62,22 @@ def create_register_task(body: RegisterTaskRequest):
             allow_reuse = str(extra.get("local_ms_pool_allow_reuse") or "").strip().lower() in {
                 "1", "true", "yes", "on"
             }
-            if not allow_reuse and len(rows) < body.count:
+            capacity = len(rows) * MAX_OUTLOOK_SUBADDRESS_COUNT
+            if not allow_reuse and capacity < body.count:
                 raise HTTPException(
                     400,
-                    f"Outlook 有效账号数 {len(rows)} 少于注册数量 {body.count}",
+                    f"Outlook 子邮箱容量 {capacity} 少于注册数量 {body.count}（每个母邮箱最多 6 个）",
                 )
         mail_provider = "local_ms_pool"
         extra["mail_provider"] = mail_provider
     payload["extra"] = extra
     if mail_provider:
         extra["mail_provider"] = mail_provider
+    if upload_config:
+        return command_service.create_register_task(
+            payload,
+            sub2api_upload=upload_config,
+        )
     return command_service.create_register_task(payload)
 
 

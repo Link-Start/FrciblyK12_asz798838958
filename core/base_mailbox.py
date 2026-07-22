@@ -132,6 +132,7 @@ def _create_local_ms_pool(extra: dict, proxy: str | None) -> BaseMailbox:
         graph_scope=extra.get("local_ms_graph_scope", ""),
         allow_reuse=str(extra.get("local_ms_pool_allow_reuse", "")).strip().lower()
         in {"1", "true", "yes", "on"},
+        alias_count=extra.get("local_ms_pool_alias_count", 1),
         proxy=proxy,
     )
 
